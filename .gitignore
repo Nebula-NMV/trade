@@ -1,0 +1,5 @@
+.env
+.signal-bot-state.json
+.signal-bot-state.tmp
+__pycache__/
+*.py[cod]

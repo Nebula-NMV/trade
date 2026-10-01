@@ -213,6 +213,13 @@ def intraday_live_signal(rows, price, previous_price, owned):
     if fast is None or slow is None or momentum is None:
         return None, "รอข้อมูลตัวชี้วัดระหว่างวัน"
     if owned:
+        # The entry is made from the live price after the latest completed
+        # bar. Keep watching ticks, but do not let that same bar's setup turn
+        # into an immediate strategy exit. Alpaca's OCO stop/target protect
+        # the position during this short confirmation window.
+        entry_bar = owned.get("entry_bar")
+        if entry_bar and rows[-1].get("t", "") <= entry_bar:
+            return None, "ถือสถานะหลังซื้อ · รอแท่ง 1 นาทีถัดไปยืนยันสัญญาณขาย"
         if price < slow:
             return "sell", "ราคาล่าสุดหลุด EMA 21 ระหว่างแท่ง"
         if momentum < 45:
@@ -222,7 +229,7 @@ def intraday_live_signal(rows, price, previous_price, owned):
         return None, "รอราคาอัปเดตถัดไปเพื่อยืนยันจังหวะเข้า"
     previous_fast = _ema(closes + [float(previous_price)], 9)[-1]
     crossed_up = previous_price <= previous_fast and price > fast
-    if fast > slow and crossed_up and 50 <= momentum <= 70:
+    if fast > slow and price > slow and crossed_up and 50 <= momentum <= 70:
         return "buy", "ราคาตัดกลับเหนือ EMA 9 ในแนวโน้มขึ้น และ RSI อยู่ในช่วง 50–70"
     return None, "รอสัญญาณราคาแบบเรียลไทม์"
 

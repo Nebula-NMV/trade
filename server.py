@@ -13,10 +13,13 @@ import os
 import re
 import time
 
-from strategy_engine import STRATEGIES as BOT_STRATEGIES, generate_signals, protective_prices
+from strategy_engine import (STRATEGIES as BOT_STRATEGIES, generate_signals,
+                             intraday_live_signal, protective_prices)
 
 ROOT = Path(__file__).resolve().parent
 PAPER_API_BASE_URL = "https://paper-api.alpaca.markets/v2"
+US_STOCKS_CACHE = {"expires_at": 0, "stocks": []}
+US_STOCKS_CACHE_LOCK = RLock()
 
 
 def load_dotenv():
@@ -346,12 +349,14 @@ def place_oco_protection(symbol, position, owned):
     target = float(owned.get("target", 0))
     if qty <= 0 or stop <= 0 or target <= stop:
         raise ValueError("ปริมาณหรือระดับ OCO ไม่ถูกต้อง")
+    entry_id = re.sub(r"[^0-9A-Za-z]", "", str(owned.get("order_id", "")))[-10:]
+    client_suffix = entry_id or re.sub(r"[^0-9A-Za-z]", "", str(owned.get("entry_date", "")))[-10:]
     result = alpaca_request("/orders", method="POST", payload={
         "symbol": symbol, "qty": f"{qty:.6f}".rstrip("0").rstrip("."), "side": "sell",
         "type": "limit", "time_in_force": "gtc", "order_class": "oco",
         "take_profit": {"limit_price": order_price(target)},
         "stop_loss": {"stop_price": order_price(stop)},
-        "client_order_id": f"signalbot-{symbol.lower()}-{owned.get('entry_date','')}-oco",
+        "client_order_id": f"sg-{symbol.lower()}-{client_suffix}-oco",
     })
     owned["protection_order_id"] = result.get("id")
     return result
@@ -402,10 +407,14 @@ def auto_bot_realtime_loop(stop_event):
     account, positions, order_history, open_orders = {}, {}, [], []
     orders_by_id, pending = {}, set()
     next_sync = 0.0
+    market_clock, next_clock_sync = None, 0.0
     while not stop_event.is_set():
         try:
             config = bot_snapshot()
             now_mono = time.monotonic()
+            if now_mono >= next_clock_sync:
+                next_clock_sync = now_mono + 30
+                market_clock = alpaca_request("/clock")
             if now_mono >= next_sync:
                 account = alpaca_request("/account")
                 if account.get("trading_blocked") or account.get("account_blocked"):
@@ -468,12 +477,15 @@ def auto_bot_realtime_loop(stop_event):
                                 else:
                                     close_intraday_unprotected(owned_symbol, position, owned_data)
                                     bot_log(f"{owned_symbol}: คำนวณ Stop ไม่ได้ · ส่งคำสั่งปิด Paper")
-                next_sync = time.monotonic() + 5
+                next_sync = time.monotonic() + (5 if intraday_session_open() else 60)
 
             now = datetime.now(timezone.utc)
-            if intraday_session_open(now):
+            market_open = bool(market_clock and market_clock.get("is_open"))
+            if market_open:
                 eastern_now = to_eastern(now)
                 minute_key = eastern_now.strftime("%Y-%m-%d %H:%M")
+                market_close = datetime.fromisoformat(market_clock["next_close"].replace("Z", "+00:00")).astimezone(timezone.utc)
+                minutes_to_close = (market_close - now).total_seconds() / 60
                 for symbol in config["symbols"]:
                     if stop_event.is_set():
                         break
@@ -486,29 +498,26 @@ def auto_bot_realtime_loop(stop_event):
                     if owned and (owned.get("awaiting_fill") or owned.get("exit_order_id")):
                         continue
                     local_now = to_eastern(now)
-                    force_close = bool(position and owned and local_now.hour * 60 + local_now.minute >= 15 * 60 + 50)
-                    try:
+                    force_close = bool(position and owned and minutes_to_close <= 10)
+                    if force_close:
+                        bars = []
+                    else:
                         cached = bars_cache.get(symbol)
                         if not cached or cached["minute"] != minute_key:
                             bars = fetch_intraday_bars(symbol)
                             bars_cache[symbol] = {"minute": minute_key, "bars": bars}
                         else:
                             bars = cached["bars"]
-                    except (RuntimeError, ValueError, KeyError, TypeError):
-                        if not force_close:
-                            raise
-                        bars = []
-                    if not force_close:
                         if len(bars) < 23:
                             continue
-                        latest_bar_time = datetime.fromisoformat(bars[-1]["t"].replace("Z", "+00:00"))
-                        if (to_eastern(latest_bar_time).date() != to_eastern(now).date()
-                                or now - latest_bar_time > timedelta(minutes=3)):
-                            continue
+                    with BOT_LOCK:
+                        stream_connected = BOT.get("market_stream_status") == "connected"
                     tick = None
                     with BOT_MARKET_LOCK:
                         tick = BOT_LIVE_TRADES.get(symbol)
                     if not force_close:
+                        if not stream_connected:
+                            continue
                         if not tick or time.monotonic() - tick.get("received_at", 0) > 3:
                             continue
                         tick_timestamp = tick.get("timestamp") or str(tick.get("received_at"))
@@ -523,7 +532,7 @@ def auto_bot_realtime_loop(stop_event):
                         signal, reason = "sell", "ปิดสถานะก่อนตลาดสหรัฐฯ ปิด"
                     if signal is None:
                         continue
-                    if signal == "buy" and local_now.hour * 60 + local_now.minute >= 15 * 60 + 45:
+                    if signal == "buy" and minutes_to_close <= 15:
                         continue
                     if symbol in pending and not (signal == "sell" and position and owned):
                         continue
@@ -614,6 +623,14 @@ def auto_bot_realtime_loop(stop_event):
             persist_bot_state()
         except (RuntimeError, ValueError, KeyError, TypeError) as exc:
             bot_log(f"Intraday Live รอบนี้มีข้อผิดพลาด · {exc}")
+            if stop_event.wait(2):
+                break
+            continue
+        except Exception as exc:
+            bot_log(f"Intraday Live เกิดข้อผิดพลาดภายใน ({type(exc).__name__}) · {exc} · จะลองใหม่ใน 2 วินาที")
+            if stop_event.wait(2):
+                break
+            continue
         if stop_event.wait(.25):
             break
     try:
@@ -632,7 +649,16 @@ def auto_bot_realtime_loop(stop_event):
 
 def auto_bot_loop(stop_event):
     if bot_snapshot().get("strategy") == "intraday5m":
-        auto_bot_realtime_loop(stop_event)
+        try:
+            auto_bot_realtime_loop(stop_event)
+        except Exception as exc:
+            bot_log(f"บอท Intraday Live หยุดเพราะข้อผิดพลาด ({type(exc).__name__}) · {exc}")
+            with BOT_LOCK:
+                BOT["active"] = False
+                BOT["thread"] = None
+                BOT["stop_event"] = None
+                BOT["market_stream_status"] = "error"
+            persist_bot_state()
         return
     while not stop_event.is_set():
         try:
@@ -943,9 +969,13 @@ def start_auto_bot(payload):
             raise ValueError("บอทกำลังทำงานอยู่แล้ว")
         stop_event = Event()
         initial_message = "เริ่มบอทแล้ว · กำลังเชื่อมต่อสตรีมราคา Live" if strategy == "intraday5m" else "เริ่มบอทแล้ว · รอตรวจแท่งรายวันปิด"
+        if strategy == "intraday5m":
+            with BOT_MARKET_LOCK:
+                BOT_LIVE_TRADES.clear()
         BOT.update({"active": True, "strategy": strategy, "symbols": symbols, "per_trade_usd": per_trade,
                     "max_total_usd": max_total, "started_at": datetime.now(timezone.utc).isoformat(),
                     "last_check": None, "last_message": initial_message,
+                    "market_stream_status": "connecting" if strategy == "intraday5m" else "stopped",
                     "events": [], "owned_positions": BOT.get("owned_positions", {}),
                     "processed": BOT.get("processed", {}), "stop_event": stop_event})
         thread = Thread(target=auto_bot_loop, args=(stop_event,), daemon=True, name="alpaca-paper-bot")
@@ -981,6 +1011,8 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_json(403, {"error": "คำขอ API ต้องมาจากเว็บแอปในเครื่องนี้"})
         if parsed.path.startswith("/api/alpaca/"):
             return self.handle_alpaca_get(parsed.path, parse_qs(parsed.query))
+        if parsed.path == "/api/universe/us-stocks":
+            return self.handle_us_stock_universe()
         if parsed.path != "/api/chart":
             return super().do_GET()
         symbol = parse_qs(parsed.query).get("symbol", [""])[0].strip().upper()
@@ -1002,6 +1034,49 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_json(exc.code, {"error": "ผู้ให้บริการข้อมูลปฏิเสธคำขอ ลองอีกครั้งภายหลัง"})
         except (URLError, TimeoutError, OSError):
             self.send_json(502, {"error": "เชื่อมต่อผู้ให้บริการข้อมูลไม่ได้ ตรวจสอบอินเทอร์เน็ตแล้วลองใหม่"})
+
+    def handle_us_stock_universe(self):
+        with US_STOCKS_CACHE_LOCK:
+            if US_STOCKS_CACHE["stocks"] and US_STOCKS_CACHE["expires_at"] > time.time():
+                return self.send_json(200, {"stocks": US_STOCKS_CACHE["stocks"], "source": "Nasdaq Trader Symbol Directory",
+                                            "updated_at": datetime.fromtimestamp(US_STOCKS_CACHE["expires_at"] - 43200, timezone.utc).isoformat()})
+            sources = (
+                ("https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt", "nasdaq"),
+                ("https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt", "other"),
+            )
+            stocks, seen = [], set()
+            try:
+                for url, market in sources:
+                    request = Request(url, headers={"User-Agent": "Mozilla/5.0 SignalTechnicalAnalysis/1.0"})
+                    with urlopen(request, timeout=20) as response:
+                        rows = response.read().decode("utf-8-sig", errors="replace").splitlines()
+                    if not rows or "|" not in rows[0]:
+                        raise ValueError("รูปแบบรายชื่อหุ้นจาก Nasdaq Trader ไม่ถูกต้อง")
+                    headers = [value.strip().casefold() for value in rows[0].split("|")]
+                    for line in rows[1:]:
+                        columns = line.split("|")
+                        if len(columns) < len(headers) or line.startswith("File Creation Time"):
+                            continue
+                        row = dict(zip(headers, columns))
+                        symbol = (row.get("symbol") if market == "nasdaq" else row.get("cqs symbol") or row.get("act symbol") or "").strip().upper().replace("/", "-")
+                        name = row.get("security name", "").strip()
+                        if (row.get("test issue", "N").strip().upper() == "Y"
+                                or row.get("etf", "N").strip().upper() == "Y"
+                                or re.search(r"\b(warrants?|rights?|units?|preferred|debentures?|notes?|bonds?)\b", name, re.IGNORECASE)
+                                or not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,14}", symbol)
+                                or symbol in seen or not name):
+                            continue
+                        seen.add(symbol)
+                        stocks.append({"symbol": symbol, "name": name,
+                                       "exchange": "NASDAQ" if market == "nasdaq" else row.get("exchange", "").strip()})
+            except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
+                return self.send_json(503, {"error": f"โหลดรายชื่อหุ้นสหรัฐฯ ไม่สำเร็จ · {exc}"})
+            if not stocks:
+                return self.send_json(503, {"error": "ไม่พบรายชื่อหุ้นใน Nasdaq Trader Symbol Directory"})
+            expires_at = time.time() + 43200
+            US_STOCKS_CACHE.update({"expires_at": expires_at, "stocks": stocks})
+            return self.send_json(200, {"stocks": stocks, "source": "Nasdaq Trader Symbol Directory",
+                                        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds")})
 
     def do_POST(self):
         parsed = urlparse(self.path)

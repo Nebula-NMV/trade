@@ -1006,6 +1006,8 @@ class Handler(SimpleHTTPRequestHandler):
         super().__init__(*args, directory=str(ROOT), **kwargs)
 
     def do_GET(self):
+        if urlparse(self.path).path == "/health":
+            return self.send_json(200, {"status": "ok"})
         if not self.authorize_request():
             return
         parsed = urlparse(self.path)

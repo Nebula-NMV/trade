@@ -19,6 +19,7 @@ const BOT_SYMBOL_CATALOG = [
 ];
 let botSelectedSymbols = ['AAPL'];
 let botSymbolsInitialized = false;
+let botUniversePromise = null;
 const watchDetails = {
   'AAPL': {name:'AAPL',sub:'Apple',color:'green'},
   'MSFT': {name:'MSFT',sub:'Microsoft',color:'blue'},
@@ -134,20 +135,25 @@ function renderBotSymbols(symbols,persist=true){
   $('botSymbolList').innerHTML=botSelectedSymbols.length?botSelectedSymbols.map(symbol=>`<span class="bot-symbol-chip">${escapeHtml(symbol)}<button type="button" data-remove-bot-symbol="${escapeHtml(symbol)}" aria-label="นำ ${escapeHtml(symbol)} ออกจากรายการ" title="นำออก">−</button></span>`).join(''):'<span class="bot-symbol-empty">ยังไม่ได้เลือกหุ้น</span>';
   if(persist){try{localStorage.setItem(BOT_SYMBOLS_KEY,JSON.stringify(botSelectedSymbols))}catch(_){}}
 }
-function getBotSymbolCatalog(){
+async function getBotSymbolCatalog(){
   const catalog=new Map(BOT_SYMBOL_CATALOG.map(([symbol,name])=>[symbol,{symbol,name}]));
   try{const watchlist=JSON.parse(localStorage.getItem(WATCHLIST_KEY)||'[]');if(Array.isArray(watchlist))watchlist.forEach(value=>{const symbol=String(value).trim().toUpperCase();if(/^[A-Z][A-Z0-9.-]{0,14}$/.test(symbol)&&!symbol.endsWith('.BK')&&!catalog.has(symbol))catalog.set(symbol,{symbol,name:'จาก Watchlist'})})}catch(_){}
+  if(!botUniversePromise)botUniversePromise=fetch('/api/universe/us-stocks').then(async response=>{if(!response.ok)throw new Error(`โหลดรายชื่อหุ้นไม่สำเร็จ (${response.status})`);const data=await response.json();if(!Array.isArray(data.stocks))throw new Error('รูปแบบรายชื่อหุ้นไม่ถูกต้อง');return data.stocks});
+  try{const stocks=await botUniversePromise;stocks.forEach(item=>{const symbol=String(item.symbol||'').trim().toUpperCase();if(/^[A-Z][A-Z0-9.-]{0,14}$/.test(symbol)&&!catalog.has(symbol))catalog.set(symbol,{symbol,name:item.name||symbol})})}catch(error){botUniversePromise=null;throw error}
   return [...catalog.values()];
 }
-function renderBotSymbolSuggestions(query){
+async function renderBotSymbolSuggestions(query){
   const root=$('botSymbolSuggestions'),normalized=query.trim().toLowerCase();
   if(!normalized){root.hidden=true;root.innerHTML='';return}
-  const matches=getBotSymbolCatalog().filter(item=>item.symbol.toLowerCase().includes(normalized)||item.name.toLowerCase().includes(normalized)).slice(0,8);
+  root.hidden=false;root.innerHTML='<span class="bot-symbol-no-match">กำลังค้นหารายชื่อหุ้นสหรัฐฯ…</span>';
+  let catalog;try{catalog=await getBotSymbolCatalog()}catch(_){if($('botSymbolSearch').value.trim().toLowerCase()===normalized)root.innerHTML='<span class="bot-symbol-no-match">โหลดรายชื่อหุ้นไม่สำเร็จ · ลองพิมพ์ใหม่อีกครั้ง</span>';return}
+  if($('botSymbolSearch').value.trim().toLowerCase()!==normalized)return;
+  const matches=catalog.filter(item=>item.symbol.toLowerCase().includes(normalized)||item.name.toLowerCase().includes(normalized)).slice(0,12);
   root.innerHTML=matches.length?matches.map(item=>`<button type="button" role="option" data-bot-suggest="${escapeHtml(item.symbol)}"><b>${escapeHtml(item.symbol)}</b><span>${escapeHtml(item.name)}</span></button>`).join(''):'<span class="bot-symbol-no-match">ไม่พบหุ้นนี้ · ลองค้นจาก Watchlist</span>';
   root.hidden=false;
 }
-function addBotSymbol(){
-  const query=$('botSymbolSearch').value.trim().toUpperCase(),item=getBotSymbolCatalog().find(candidate=>candidate.symbol===query);
+async function addBotSymbol(){
+  const query=$('botSymbolSearch').value.trim().toUpperCase();let catalog;try{catalog=await getBotSymbolCatalog()}catch(_){toast('โหลดรายชื่อหุ้นไม่สำเร็จ · ลองอีกครั้ง');return}const item=catalog.find(candidate=>candidate.symbol===query);
   if(!item){toast('เลือกหุ้นจากรายการผลค้นหาก่อนกด +');renderBotSymbolSuggestions($('botSymbolSearch').value);return}
   if(botSelectedSymbols.includes(item.symbol)){toast(`${item.symbol} อยู่ในรายการแล้ว`);return}
   if(botSelectedSymbols.length>=10){toast('เลือกหุ้นได้สูงสุด 10 ตัว');return}

@@ -8,6 +8,8 @@ from datetime import datetime, timedelta, timezone
 from threading import Event, RLock, Thread
 from urllib.parse import urlencode
 import json
+import base64
+import hmac
 import math
 import os
 import re
@@ -1004,6 +1006,8 @@ class Handler(SimpleHTTPRequestHandler):
         super().__init__(*args, directory=str(ROOT), **kwargs)
 
     def do_GET(self):
+        if not self.authorize_request():
+            return
         parsed = urlparse(self.path)
         if any(part.casefold() in {".env", BOT_STATE_PATH.name.casefold()} for part in Path(unquote(parsed.path)).parts):
             return self.send_json(404, {"error": "ไม่พบไฟล์นี้"})
@@ -1015,11 +1019,15 @@ class Handler(SimpleHTTPRequestHandler):
             return self.handle_us_stock_universe()
         if parsed.path != "/api/chart":
             return super().do_GET()
-        symbol = parse_qs(parsed.query).get("symbol", [""])[0].strip().upper()
+        query = parse_qs(parsed.query)
+        symbol = query.get("symbol", [""])[0].strip().upper()
+        history_range = query.get("range", ["10y"])[0]
         if not re.fullmatch(r"[A-Z0-9^=._-]{1,24}", symbol):
             return self.send_json(400, {"error": "รูปแบบสัญลักษณ์หุ้นไม่ถูกต้อง"})
+        if history_range not in {"10y", "max"}:
+            return self.send_json(400, {"error": "ช่วงข้อมูลกราฟไม่ถูกต้อง"})
         url = ("https://query1.finance.yahoo.com/v8/finance/chart/"
-               f"{quote(symbol, safe='^=._-')}?range=10y&interval=1d&events=div%2Csplits")
+               f"{quote(symbol, safe='^=._-')}?range={history_range}&interval=1d&events=div%2Csplits")
         try:
             request = Request(url, headers={"User-Agent": "Mozilla/5.0 SignalTechnicalAnalysis/1.0"})
             with urlopen(request, timeout=15) as response:
@@ -1079,6 +1087,8 @@ class Handler(SimpleHTTPRequestHandler):
                                         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds")})
 
     def do_POST(self):
+        if not self.authorize_request():
+            return
         parsed = urlparse(self.path)
         if parsed.path.startswith("/api/") and not self.valid_local_api_request():
             return self.send_json(403, {"error": "ปฏิเสธคำขอจากแหล่งที่มาอื่น"})
@@ -1096,16 +1106,16 @@ class Handler(SimpleHTTPRequestHandler):
     def valid_local_api_request(self):
         """Reject cross-origin browser requests and Host-header rebinding."""
         try:
-            host = urlsplit("//" + self.headers.get("Host", "")).hostname
-            port = urlsplit("//" + self.headers.get("Host", "")).port
-            if host not in {"127.0.0.1", "localhost"} or port != self.server.server_port:
+            host_header = self.headers.get("Host", "")
+            host = urlsplit("//" + host_header).hostname
+            if not host or host_header != self.headers.get("Host", ""):
                 return False
             origin = self.headers.get("Origin")
             if origin:
                 parsed_origin = urlsplit(origin)
-                origin_port = parsed_origin.port or (80 if parsed_origin.scheme == "http" else 443)
-                if (parsed_origin.scheme != "http" or parsed_origin.hostname != host
-                        or origin_port != self.server.server_port or parsed_origin.username or parsed_origin.password):
+                forwarded_proto = self.headers.get("X-Forwarded-Proto", "http").split(",", 1)[0].strip()
+                if (parsed_origin.scheme not in {"http", "https"} or parsed_origin.hostname != host
+                        or parsed_origin.scheme != forwarded_proto or parsed_origin.username or parsed_origin.password):
                     return False
             if self.headers.get("Sec-Fetch-Site", "").lower() == "cross-site":
                 return False
@@ -1407,6 +1417,26 @@ class Handler(SimpleHTTPRequestHandler):
         except RuntimeError as exc:
             self.send_json(503, {"error": str(exc)})
 
+    def authorize_request(self):
+        """Require an access password on internet-facing deployments."""
+        password = os.environ.get("APP_ACCESS_PASSWORD", "")
+        if not password:
+            return True
+        supplied = self.headers.get("Authorization", "")
+        scheme = ""
+        try:
+            scheme, encoded = supplied.split(" ", 1)
+            _, candidate = base64.b64decode(encoded, validate=True).decode("utf-8").split(":", 1)
+        except (ValueError, UnicodeError):
+            candidate = ""
+        if scheme.lower() == "basic" and hmac.compare_digest(candidate, password):
+            return True
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="Signal", charset="UTF-8"')
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return False
+
     def send_json(self, status, payload):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -1418,8 +1448,10 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    host = "127.0.0.1"
-    for port in range(8000, 8011):
+    deployment_port = os.environ.get("PORT")
+    host = "0.0.0.0" if deployment_port else "127.0.0.1"
+    ports = [int(deployment_port)] if deployment_port else range(8000, 8011)
+    for port in ports:
         try:
             server = ThreadingHTTPServer((host, port), Handler)
             break
@@ -1428,5 +1460,5 @@ if __name__ == "__main__":
     else:
         raise SystemExit("ไม่พบพอร์ตว่างระหว่าง 8000–8010 ปิดเซิร์ฟเวอร์เก่าหรือลองใหม่")
 
-    print(f"Signal is ready at http://{host}:{server.server_port}")
+    print(f"Signal is ready on port {server.server_port}")
     server.serve_forever()

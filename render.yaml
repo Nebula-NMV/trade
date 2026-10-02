@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: signal-stock-analysis
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    healthCheckPath: /
+    envVars:
+      - key: APP_ACCESS_PASSWORD
+        generateValue: true

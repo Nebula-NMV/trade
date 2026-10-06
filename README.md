@@ -1,6 +1,6 @@
 # Signal · วิเคราะห์ทางเทคนิค
 
-เว็บแอพภาษาไทยสำหรับวิเคราะห์หุ้นสหรัฐฯ ดูกราฟ แนวโน้ม อินดิเคเตอร์ แนวรับ/แนวต้าน กลยุทธ์ย้อนหลัง และทดลองซื้อขายผ่าน Alpaca Paper Trading
+เว็บแอพสำหรับวิเคราะห์หุ้นสหรัฐฯ ดูกราฟ แนวโน้ม อินดิเคเตอร์ แนวรับ/แนวต้าน กลยุทธ์ย้อนหลัง และเชื่อม Alpaca Paper หรือ Alpaca Live Trading ตามโหมดที่ตั้งบนเซิร์ฟเวอร์
 
 ## เปิดแอพ
 
@@ -27,10 +27,10 @@
 
 ## Alpaca Paper Trading
 
-**Intraday Live** requires the Python package `websocket-client`. Install it in the same environment used to run the server: `python -m pip install -r requirements.txt`.
 
 
-หน้า **Alpaca Paper** ใช้ดูยอดบัญชีจำลอง สถานะหุ้น คำสั่งล่าสุด ส่งคำสั่ง Market/Limit และเปิดบอทซื้อขายอัตโนมัติแบบ Paper เท่านั้น เซิร์ฟเวอร์อ่านคีย์จากไฟล์ `.env` ในโฟลเดอร์โปรเจกต์ และ `.gitignore` กันไฟล์นี้ออกจาก Git แล้ว ห้ามใส่คีย์ใน `app.js` หรือ HTML
+
+หน้า **Alpaca Trading** ใช้ดูยอดบัญชี สถานะหุ้น คำสั่งล่าสุด ส่งคำสั่ง Market/Limit และเปิดบอทซื้อขาย เซิร์ฟเวอร์อ่านคีย์จากไฟล์ `.env` ในโฟลเดอร์โปรเจกต์ และ `.gitignore` กันไฟล์ความลับออกจาก Git แล้ว ห้ามใส่คีย์ใน `app.js` หรือ HTML โหมดเริ่มต้นคือ Paper
 
 1. สร้างบัญชี Paper ใน Alpaca แล้วคัดลอก Paper API Key และ Secret จากหน้า Dashboard
 2. เปิดไฟล์ `.env` ด้วยโปรแกรมแก้ไขข้อความ แล้วใส่คีย์ Paper:
@@ -39,25 +39,46 @@
    ALPACA_API_BASE_URL=https://paper-api.alpaca.markets/v2
    ALPACA_API_KEY=ใส่_Paper_API_Key
    ALPACA_SECRET_KEY=ใส่_Paper_Secret
+   TELEGRAM_BOT_TOKEN=
+   TELEGRAM_CHAT_ID=
+   DISCORD_WEBHOOK_URL=
    ```
+
+ค่า Telegram/Discord เป็นตัวเลือก: ใส่ Telegram bot token คู่กับ chat ID หรือใส่ Discord webhook URL เพื่อรับแจ้งเตือนเมื่อบอทส่งคำสั่งซื้อ/ขาย หรือปิดสถานะฉุกเฉินเพราะวาง OCO ไม่สำเร็จ ระบบบันทึกเหตุการณ์และคำสั่งลง `.signal-bot-journal.sqlite3` ในเครื่องเดียวกัน โดยอัปเดตสถานะ/ราคา fill เมื่อดึงประวัติคำสั่งจาก Alpaca; Slippage เทียบกับราคาอ้างอิงตอนส่งคำสั่ง ไม่ใช่ค่าประมาณผล backtest ฐานข้อมูลนี้เป็นไฟล์ในเครื่องและไม่ซิงก์ข้าม instance เช่น Render
 
    มีไฟล์ `.env.example` เป็นแม่แบบ หากเปลี่ยนคีย์ใน `.env` ระหว่างที่เซิร์ฟเวอร์เปิดอยู่ ให้ปิดแล้วเริ่ม `python server.py` ใหม่
 
-3. เปิดเว็บ เลือก **Alpaca Paper** แล้วกดรีเฟรชบัญชี
+3. เปิดเว็บ เลือก **Alpaca Trading** แล้วกดรีเฟรชบัญชี
 
-เซิร์ฟเวอร์ล็อกปลายทางไว้ที่ `https://paper-api.alpaca.markets/v2` จึงไม่ส่งคำสั่งไปบัญชีเงินจริง
+#### เตรียมบัญชี Live (เงินจริง)
+
+Live ถูกปิดเป็นค่าเริ่มต้น หากต้องการเปิดใช้งาน ต้องตั้ง `ALPACA_TRADING_MODE=live`, `ALPACA_LIVE_TRADING_ENABLED=true`, รหัสผ่านเว็บที่คาดเดายากใน `APP_ACCESS_PASSWORD` และ credentials แยกของบัญชี Live (`ALPACA_LIVE_API_KEY`, `ALPACA_LIVE_SECRET_KEY`) จากหน้า Environment Variables ของโฮสต์ แล้วรีสตาร์ตเซิร์ฟเวอร์ ห้ามใช้ Paper keys กับ Live endpoint และอย่า commit credentials
+
+บนโฮสต์ที่กำหนด `PORT` (เช่น Render) Live จะเริ่มไม่ได้หากไม่มี `ALPACA_LIVE_DATA_DIR` ที่เป็น absolute path ของ persistent disk ซึ่ง mount แล้วและเขียนได้ อย่าใช้แผนที่หยุด/พัก service ระหว่างตลาดเปิด เพราะบอทต้องออนไลน์เพื่อจัดการ exit signals
+
+โหมด Live จำกัดคำสั่งซื้อไม่เกิน `$ALPACA_LIVE_MAX_ORDER_USD` (ค่าเริ่มต้น $500, ปรับได้สูงสุด $10,000), บอทจำกัด risk ต่อรายการ 0.5%, daily loss 1% และ 3 รายการต่อวัน; การขายด้วยมือจำกัดไม่ให้เปิด Short และทุกคำสั่งซื้อ/เริ่มบอทต้องยืนยันข้อความ `I UNDERSTAND LIVE TRADING` สถานะและ journal ของ Live แยกจาก Paper
+
+ขั้นตอนนี้ทำให้โค้ดรองรับการเชื่อม Live แต่ไม่ได้ทดสอบด้วย Live credentials หรือส่งคำสั่งเงินจริง ต้องทดสอบจนจบใน Paper และตรวจบัญชี/การสมัครข้อมูล/สิทธิ์ซื้อขายกับ Alpaca ก่อนเปิด Live คำสั่ง Market อาจจับคู่ต่างจากราคาประเมิน และ Stop เป็นเพียงระดับกระตุ้น ไม่ใช่ราคาขายที่รับประกัน
+
+The Plan and Backtest share 15 daily strategies, five per holding horizon. Short term: EMA pullback, 20-day breakout, MACD momentum, Bollinger/RSI reversal, and 5-day momentum. Medium term: EMA pullback, 50-day breakout, MACD trend, relative strength versus SPY, and SMA 50/200 reclaim. Long term: EMA 50/200 trend, 100-day breakout, MACD primary trend, relative strength versus SPY, and rising 200-day reclaim. The Paper Bot also retains these daily strategies and adds five separate Intraday strategies that use the IEX trade stream and completed one-minute bars: 15-minute Opening Range Breakout, EMA Momentum, VWAP Pullback, VWAP Reclaim, and VWAP Mean Reversion. Intraday entries use their own stop/target settings and close before market close.
+
+รัน unit tests และตรวจความตรงกันของตัวชี้วัด JavaScript/Python ด้วยข้อมูลเดียวกันด้วย `python -m unittest discover -s tests -v` (ต้องมี Node.js สำหรับ parity test)
+
+เซิร์ฟเวอร์เลือก endpoint จาก `ALPACA_TRADING_MODE`: Paper ใช้ `https://paper-api.alpaca.markets/v2`, Live ใช้ `https://api.alpaca.markets/v2` พร้อม credentials คนละชุด และ Live ต้องเปิด kill switch เพิ่มอีกชั้น
 
 API คำสั่งซื้อและควบคุมบอทรับเฉพาะ `Host` ในเครื่องนี้ ปฏิเสธ `Origin` ที่ไม่ตรงกับหน้าเว็บ และบล็อกคำขอที่ระบุว่าเป็น cross-site
 
 ### บอทซื้อขายอัตโนมัติ
 
-ในหน้า **Alpaca Paper** เลือกหุ้น 1–10 ตัว กลยุทธ์ และวงเงินต่อหุ้น/วงเงินรวม แล้วกด **เริ่มบอท Paper** เพื่อเริ่มทำงาน กด **หยุดบอท** เพื่อหยุดการตรวจสัญญาณและส่งคำสั่งใหม่ บอททำงานอยู่ในโปรเซส `server.py`; ต้องเปิดเซิร์ฟเวอร์ค้างไว้ บอทจะหยุดเมื่อปิดหรือเริ่มเซิร์ฟเวอร์ใหม่
+ในหน้า **Alpaca Trading** เลือกหุ้น 1–10 ตัว แล้วเลือกกลยุทธ์แยกในแต่ละหุ้น (ค่าเริ่มต้นคือ **อัตโนมัติ · ให้ระบบเลือก**) พร้อมกำหนดวงเงินและความเสี่ยงก่อนเริ่มบอท ระบบอัตโนมัติใช้แท่ง IEX 1 นาทีล่าสุด, VWAP/EMA/RSI, Relative Volume และ SPY เพื่อเลือกหนึ่งในห้ากลยุทธ์ Intraday พร้อมแสดงเหตุผลไว้ใต้หุ้นและในบันทึกเหตุการณ์ การเลือกนี้เป็นการจับคู่สภาพข้อมูลล่าสุดกับกฎของกลยุทธ์ ไม่ใช่การจัดอันดับกำไรหรือการรับประกันผล กลยุทธ์ที่เลือกจะคงที่ตลอดรอบบอท; สถานะที่เปิดอยู่จะคงกลยุทธ์เดิมเพื่อจัดการทางออก
 
-เลือกได้ระหว่าง Swing สั้น EMA 9/21 + RSI + ATR, EMA 20/50, RSI 14, EMA 20/50 + MACD, Donchian 20/50 และปฏิทินซื้อ + Donchian 50 ขาย ระบบดึงแท่งรายวันจาก Alpaca Market Data (IEX) และประเมินหลังแท่งของวันปิดแล้ว; คำสั่งเข้าเป็น Limit และมี Bracket Stop/Take Profit แทนการซื้อ Market แต่ละรอบมีเพดาน $10,000 ต่อหุ้น, $100,000 รวม และจำกัดสัญลักษณ์ 10 ตัว
+หุ้นทั้งหมดในหนึ่งรอบต้องใช้กรอบเวลาเดียวกัน (รายวันหรือ Intraday Live) เพราะรอบบอทหนึ่งใช้ตัวประมวลผลกรอบเวลาเดียว กด **หยุดบอท** เพื่อหยุดการตรวจสัญญาณและส่งคำสั่งใหม่ บอททำงานอยู่ในโปรเซส `server.py`; ต้องเปิดเซิร์ฟเวอร์ค้างไว้ บอทจะหยุดเมื่อปิดหรือเริ่มเซิร์ฟเวอร์ใหม่
 
-ระบบใช้บัญชี Paper เท่านั้น ไม่มีโหมด Live · บอทส่งคำสั่ง Bracket GTC แบบหุ้นเต็มจำนวน โดยใช้ Stop 1.5 ATR และ Take Profit 2R ทุกกลยุทธ์; จุดเข้าเป็น Limit ที่เผื่อจากราคาปิดล่าสุดราว 1% (อย่างน้อย $0.02) และยกเลิกคำสั่งเข้าที่ยังไม่จับคู่หลัง 7 วัน หากงบไม่พอซื้อหนึ่งหุ้นเต็ม บอทจะข้ามสัญญาณ
-Stop/Take Profit ที่ส่งให้ Alpaca จะทำงานต่อแม้หยุดบอทหรือปิดเซิร์ฟเวอร์; การกดหยุดยกเลิกเฉพาะคำสั่งเข้าที่ยังไม่จับคู่ และหยุดการตรวจสัญญาณขายตามกลยุทธ์ ไม่ได้ปิดหุ้นที่ถืออยู่ สถานะบอทบันทึกใน .signal-bot-state.json และกู้คืนเมื่อเปิดเซิร์ฟเวอร์อีกครั้ง โดยบอทจะไม่เริ่มเอง
-ราคา Stop เป็นระดับกระตุ้น ไม่ใช่ราคาที่รับประกันการขาย โดยเฉพาะเมื่อราคาเปิดกระโดดข้ามระดับหรือหุ้นหยุดซื้อขาย · ใช้บัญชี Paper เพื่อทดลองเท่านั้น
+In Strategy Lab, **Compare all 15 strategies** evaluates the daily strategies on the same price window, ranks by median walk-forward return in the training period, and reports a separate untouched out-of-sample period, closed trade count, and drawdown. Intraday bot strategies use a different one-minute signal path and are not included in this daily comparison. A winner is shown only when the minimum trade/sample requirements are met. Position sizing and daily risk caps remain bot controls.
+
+Daily Paper strategies use a GTC limit entry and ATR protective orders; the five Intraday strategies use the live IEX trade stream for signal timing, submit market entries, attach an OCO stop/target based on that strategy's ATR/R settings, and close before the regular session ends. Live fills can differ from one-minute bar-close estimates. A stop is a trigger price, not a guaranteed fill.
+Protective stop orders remain at Alpaca if the server stops; stopping the bot cancels pending entries but does not liquidate held shares. Trend-based exits require the server to keep running. Bot state is restored after restart, but the bot does not restart automatically.
+ราคา Stop เป็นระดับกระตุ้น ไม่ใช่ราคาที่รับประกันการขาย โดยเฉพาะเมื่อราคาเปิดกระโดดข้ามระดับหรือหุ้นหยุดซื้อขาย · ใช้ Paper ทดสอบก่อนเปิด Live เสมอ
 
 กด **นำเข้า CSV** เพื่อวิเคราะห์ข้อมูลจากไฟล์ของคุณ รองรับคอลัมน์ `Date`, `Open`, `High`, `Low`, `Close`, `Adj Close`, `Volume` รวมถึงชื่อภาษาไทย เช่น `วันที่`, `ราคาเปิด`, `ราคาสูงสุด`, `ราคาต่ำสุด`, `ราคาปิด`, `ปริมาณซื้อขาย` ต้องมีวันที่และราคาปิด และมีข้อมูลที่อ่านได้อย่างน้อย 60 วัน; แนะนำ 200 วันขึ้นไปเพื่อให้คำนวณ EMA 200 ได้ครบ หากมีเฉพาะวันที่กับราคาปิด ระบบจะสร้างแท่งราคาโดยประมาณให้
 
@@ -76,14 +97,14 @@ Stop/Take Profit ที่ส่งให้ Alpaca จะทำงานต่�
 - จังหวะลงทุนและขายตามปฏิทินจัดวันซื้อขายย้อนหลังเป็นต้นเดือน (1–10), กลางเดือน (11–20) และท้ายเดือน (21–สิ้นเดือน) คำนวณผลตอบแทนของแต่ละช่วงแยกตามเดือนปฏิทิน พร้อมหาช่วงที่อ่อน/แข็งเด่นเมื่อมีอย่างน้อย 3 ปีและผลไปทิศเดียวกันอย่างน้อย 60%; ตารางวันที่แสดงวันที่ของเดือนที่ผลตอบแทนรายวันอ่อน/แข็งเด่น โดยต้องมีอย่างน้อย 5 ตัวอย่าง; ไม่รวมเดือนปัจจุบันที่ยังไม่ปิด
 - ราคาการเปลี่ยนแปลง “วันนี้” เปรียบเทียบราคาล่าสุดกับราคาปิดวันก่อนหน้าจาก OHLC ดิบชุดเดียวกัน เพื่อไม่ผสมราคาที่ปรับเงินปันผลย้อนหลังกับราคาตลาดปัจจุบัน
 - หน้า **ภาพรวมพอร์ต** รวมรายการซื้อหลายไม้ต่อหุ้นเป็นจำนวนหุ้น ราคาเฉลี่ย มูลค่าตลาด และกำไร/ขาดทุน แยกยอดตามสกุลเงินและอ่านราคาล่าสุดจากข้อมูลที่โหลดได้
-- หน้า **ทดสอบกลยุทธ์ย้อนหลัง** ใช้ signal engine Python ชุดเดียวกับบอท เพื่อลดความต่างของกติกาสัญญาณ; ใช้ OHLC ที่ปรับ split แต่ไม่ปรับเงินปันผล จึงรายงาน price return ที่ไม่รวมเงินปันผลทั้งฝั่งกลยุทธ์และซื้อแล้วถือ
+- Backtest and Paper Bot share the same strategy catalog, signal engine, daily timeframe, and Alpaca IEX bars. Backtest models limit entries and one all-capital position; it does not apply the bot?s per-symbol caps or daily guard, and excludes dividends.
 - แบ่งข้อมูลตามเวลา โดยค่าเริ่มต้นกัน 30% ล่าสุดไว้เป็นช่วงทดสอบนอกตัวอย่าง (เลือก 20%, 40% หรือใช้ข้อมูลทั้งหมดได้); ช่วงก่อนหน้าช่วย warm-up อินดิเคเตอร์และแสดงผลช่วงฝึก แต่ไม่ได้ใช้ปรับพารามิเตอร์อัตโนมัติ
-- ผลจำลองใช้คำสั่งเข้า Limit สูงกว่าราคาปิดตอนเกิดสัญญาณประมาณ 1% ค้างได้ไม่เกิน 7 วัน และซื้อเมื่อราคาแตะ Limit; ใช้ Stop 1.5 ATR กับ Take Profit 2R ทุกกลยุทธ์ และออกตามสัญญาณที่ราคาเปิดแท่งถัดไป หากแท่งเดียวแตะทั้ง Stop และเป้ากำไร จะนับ Stop ก่อนเพื่อประเมินแบบระมัดระวัง
+Paper only: fixed-target strategies use GTC bracket orders; trailing/trend strategies use a GTC entry with a protective ATR stop and exit on the shared strategy signal. Entries use a limit about 1% above the signal close and expire after 7 days. A stop is a trigger price, not a guaranteed fill.
 - แสดงผลตอบแทน, CAGR, win rate, maximum drawdown, profit factor, expectancy ต่อรอบ, เวลาอยู่ในตลาด และเทียบซื้อแล้วถือ โดยรวมค่าธรรมเนียมและ slippage ที่ตั้งไว้ ผลทดสอบไม่รวมเงินปันผล ภาษี สภาพคล่อง และไม่ทำนายผลในอนาคต
 - ตารางความน่าเชื่อถือของสัญญาณคำนวณจากหลายจุดเวลาย้อนหลังแยกรายวัน/สัปดาห์/เดือน วัดผลหลัง 1, 5 และ 20 แท่ง นับเฉพาะสัญญาณที่เอนเอียงชัดและมีผลลัพธ์ครบ พร้อมจำนวนตัวอย่างและผลตอบแทนเฉลี่ย; จุดเวลาทับซ้อนกันได้และไม่ใช่การรับประกันผล
 - หน้าแผนลงทุนบันทึก Buy Zone, Stop, Target และการเปลี่ยนสัญญาณของ Watchlist ไว้ในเบราว์เซอร์ สแกน Watchlist ทุก 15 นาทีขณะเปิดแอพ และตรวจ Stop/Target จากแท่งราคาที่ได้รับ; ถ้าแท่งเดียวแตะทั้งสองระดับจะแสดงว่าลำดับไม่ชัด การแจ้งเตือนบนเดสก์ท็อปทำงานเมื่อเปิดแอพและอนุญาตสิทธิ์แล้ว ไม่ใช่บริการแจ้งเตือนเบื้องหลัง
-- Backtest เลือกข้อมูลรายวัน/สัปดาห์/เดือนและวันเริ่มต้น/สิ้นสุดได้ แสดงจำนวนแท่งในช่วงที่เลือก จำนวนหลัง warm-up และจำนวนแท่งในช่วงฝึก/ทดสอบ
-- ส่วนประมาณการกลยุทธ์แสดงสถานะถือ/รอซื้อ พร้อมระดับราคาปิดที่เป็นเงื่อนไขซื้อและขายของกลยุทธ์ EMA, RSI, EMA+MACD และ Donchian 20/50 วัน รวมกราฟเส้นระดับซื้อ/ขายและช่วงราคา heuristic 1–60 วัน; ราคาเหล่านี้เป็นระดับเงื่อนไขของสัญญาณ ไม่ใช่ราคาจับคู่คำสั่งหรือความน่าจะเป็นแน่นอน
+- Backtest uses daily bars to match the Paper Bot; users can select a date range and see warm-up, training, and out-of-sample bar counts.
+- The strategy projection shows holding/waiting status and relevant EMA levels for the short, medium, and long strategies, with a heuristic 1-60 day price range. It is not a probability estimate or guaranteed execution price.
 - ตารางจุดกลับตัวสูตร Classic แสดง S3, S2, S1, จุดกลับตัว, R1, R2, R3 โดยใช้ High/Low/Close ของแท่งก่อนหน้าในกรอบเวลารายวัน รายสัปดาห์ หรือรายเดือนที่เลือก
 - เลือกความละเอียดแท่งวัน/สัปดาห์/เดือน และช่วงย้อนหลัง 1 เดือน, 3 เดือน, 6 เดือน, 1 ปี, 2 ปี, 5 ปี หรือ MAX ได้แยกกัน
 - กราฟระหว่างวันเลือกแท่ง 1, 5, 15 นาที หรือ 1 ชั่วโมง และดูช่วงวันนี้/5 วันได้; ดึงแท่งจาก Alpaca Market Data (IEX) และรีเฟรชทุก 15 วินาทีระหว่างเปิดกราฟ ต้องใส่ ALPACA_API_KEY และ ALPACA_SECRET_KEY ใน `.env` แล้วเริ่ม `python server.py` ใหม่ ข้อมูล IEX ครอบคลุมตลาดเดียวและอาจต่างจากราคาตลาดรวมทุกตลาด ส่วน CSV มีเฉพาะกรอบเวลาตามข้อมูลในไฟล์

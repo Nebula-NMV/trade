@@ -1,5 +1,14 @@
 .env
+!.env.example
 .signal-bot-state.json
 .signal-bot-state.tmp
+.signal-bot-journal.sqlite3
+.signal-bot-journal.sqlite3-shm
+.signal-bot-journal.sqlite3-wal
+.signal-bot-state-live.json
+.signal-bot-state-live.tmp
+.signal-bot-journal-live.sqlite3
+.signal-bot-journal-live.sqlite3-shm
+.signal-bot-journal-live.sqlite3-wal
 __pycache__/
 *.py[cod]

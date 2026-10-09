@@ -154,6 +154,13 @@
             <label class="setting-field"><span>Slippage ต่อครั้ง</span><span class="setting-input"><input id="backtestSlippage" type="number" min="0" max="5" step="0.01" value="0.05"/><b>%</b></span></label>
             <label class="setting-field"><span>ข้อมูลทดสอบนอกตัวอย่าง</span><select id="backtestHoldout"><option value="30" selected>30% · แนะนำ</option><option value="20">20%</option><option value="40">40%</option><option value="0">100% · ไม่มี holdout</option></select></label>
           </div>
+          <div class="backtest-settings intraday-replay-settings">
+            <label class="setting-field"><span>Replay กลยุทธ์ Intraday · 1 นาที</span><select id="intradayBacktestStrategy"></select></label>
+            <label class="setting-field"><span>เสี่ยงต่อรายการ</span><span class="setting-input"><input id="intradayRiskPct" type="number" min="0.1" max="5" step="0.1" value="0.5"/><b>%</b></span></label>
+            <label class="setting-field"><span>วงเงินสูงสุดต่อไม้</span><span class="setting-input"><input id="intradayPositionPct" type="number" min="1" max="100" step="1" value="20"/><b>% ทุน</b></span></label>
+            <button class="outline-button backtest-run" id="runIntradayBacktest" type="button">Replay ข้อมูล 1 นาทีล่าสุด</button>
+          </div>
+          <div class="backtest-strategy-note">ใช้แท่ง Alpaca 1 นาทีล่าสุดประมาณ 10 วันปฏิทิน · สัญญาณแท่งปิดและจำลองเข้าที่ Open ของแท่งถัดไป · คุมขนาดด้วย Risk % และวงเงินต่อไม้ · หากแท่งเดียวแตะ Stop และเป้าพร้อมกัน ให้นับ Stop ก่อน · ผลช่วงสั้นอาจมีจำนวนรอบน้อย</div>
           <details class="backtest-advanced"><summary>ช่วงข้อมูลและตัวเลือกเพิ่มเติม</summary>
             <div class="backtest-range-settings"><label><span>กรอบเวลา</span><select id="backtestTimeframe" disabled><option value="1d">รายวัน (สอดคล้องกับ Paper Bot)</option></select></label><label><span>วันเริ่มต้น · เว้นว่างเพื่อใช้ข้อมูลเก่าสุด</span><input id="backtestDateFrom" type="date"/></label><label><span>วันสิ้นสุด · เว้นว่างเพื่อใช้ข้อมูลล่าสุด</span><input id="backtestDateTo" type="date"/></label></div>
           </details>

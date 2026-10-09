@@ -474,6 +474,104 @@ def intraday_atr(rows, period=14):
     return values[-1] if values else None
 
 
+def backtest_intraday_strategy(strategy, rows, spy_rows=None, capital=10000, fee_pct=.1,
+                               slippage_pct=.05, risk_pct=.5, max_position_pct=20):
+    """Replay one-minute signals at close and fill entries at the following bar open."""
+    if strategy not in BOT_STRATEGIES or not rows:
+        raise ValueError("กลยุทธ์หรือข้อมูล Intraday ไม่ถูกต้อง")
+    fee, slip = float(fee_pct) / 100, float(slippage_pct) / 100
+    sessions = {}
+    for row in sorted(rows, key=_timestamp):
+        local = _eastern_datetime(_timestamp(row))
+        if local.weekday() < 5 and 9 * 60 + 30 <= local.hour * 60 + local.minute < 16 * 60:
+            sessions.setdefault(local.date(), []).append(row)
+    cash, shares, entry, entry_cost, stop, target, risk = float(capital), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    entry_index = None
+    pending_entry = False
+    actions, curve, pnl_list = [], [], []
+    peak, max_drawdown, wins, fee_total = cash, 0.0, 0, 0.0
+    spec = BOT_STRATEGY_BY_ID[strategy]
+    for day, day_rows in sorted(sessions.items()):
+        for i, bar in enumerate(day_rows):
+            stamp, price = _timestamp(bar), float(bar["c"])
+            prefix = day_rows[:i]  # In live trading, the current minute is not a completed bar yet.
+            previous = float(prefix[-1]["c"]) if prefix else None
+            spy = [r for r in (spy_rows or []) if _timestamp(r) < stamp]
+            relvol = opening_relative_volume(rows, day) if spec.get("needsRelativeVolume") else None
+            local = _eastern_datetime(stamp)
+            elapsed = local.hour * 60 + local.minute - 570
+
+            if pending_entry and not shares:
+                fill = float(bar["o"]) * (1 + slip)
+                atr = intraday_atr(prefix)
+                if atr and atr > 0:
+                    risk = atr * float(spec["stopAtr"])
+                    entry = fill
+                    stop = entry - risk
+                    target = entry + risk * float(spec["rewardRisk"])
+                    equity_before = cash
+                    risk_budget = equity_before * float(risk_pct) / 100
+                    position_cap = min(equity_before, float(capital) * float(max_position_pct) / 100)
+                    shares = min(risk_budget / risk, position_cap / fill,
+                                 cash / (fill * (1 + fee)))
+                    entry_cost = shares * fill * (1 + fee)
+                    if shares > 0:
+                        cash -= entry_cost
+                        fee_total += shares * fill * fee
+                        entry_index = i
+                        actions.append({"side": "ซื้อ", "time": stamp, "price": fill, "shares": shares})
+                    else:
+                        shares = 0.0
+                pending_entry = False
+
+            signal, _ = intraday_bot_signal(
+                strategy, prefix, price, previous, spy_rows=spy, relative_volume=relvol,
+                elapsed_minutes=elapsed,
+                owned={"entry_bar": day_rows[entry_index]["t"]} if shares and entry_index is not None else None)
+
+            if shares and i > entry_index:
+                bar_open, bar_low, bar_high = float(bar["o"]), float(bar["l"]), float(bar["h"])
+                exit_price = None
+                # Resolve the old stop before considering a same-bar target or signal.
+                if bar_open <= stop:
+                    exit_price = bar_open
+                elif bar_open >= target:
+                    exit_price = bar_open
+                elif bar_low <= stop:
+                    exit_price = stop
+                elif bar_high >= target:
+                    exit_price = target
+                elif signal == "sell":
+                    exit_price = price
+                elif i == len(day_rows) - 1:
+                    exit_price = price
+                if exit_price is not None:
+                    fill = exit_price * (1 - slip)
+                    proceeds = shares * fill * (1 - fee)
+                    pnl = proceeds - entry_cost
+                    fee_total += shares * fill * fee
+                    pnl_list.append(pnl); wins += pnl > 0
+                    actions.append({"side": "ขาย", "time": stamp, "price": fill, "shares": shares, "pnl": pnl})
+                    cash += proceeds
+                    shares, entry_cost, entry_index = 0.0, 0.0, None
+                elif bar_high >= entry + risk:
+                    atr = intraday_atr(prefix) or risk
+                    stop = max(stop, entry, bar_high - atr)
+            elif not shares and signal == "buy" and i + 1 < len(day_rows):
+                pending_entry = True
+
+            equity = cash + shares * price
+            curve.append(equity); peak = max(peak, equity)
+            max_drawdown = max(max_drawdown, (peak - equity) / peak if peak else 0)
+    ending = cash + shares * float(next(reversed(list(sessions.values())))[-1]["c"]) if shares and sessions else cash
+    trades = len(pnl_list)
+    return {"strategy": strategy, "ending": ending, "returnPct": (ending / capital - 1) * 100,
+            "trades": trades, "wins": wins, "winRate": wins / trades * 100 if trades else 0,
+            "maxDrawdown": max_drawdown * 100, "fees": fee_total, "actions": actions,
+            "curve": curve, "bars": len(curve), "from": _timestamp(rows[0]), "to": _timestamp(rows[-1]),
+            "riskPct": float(risk_pct), "maxPositionPct": float(max_position_pct)}
+
+
 def intraday_bot_signal(strategy, rows, price, previous_price, spy_rows=None,
                         relative_volume=None, elapsed_minutes=0, owned=None):
     """Evaluate dedicated bot-only strategies on the current regular session."""
@@ -538,7 +636,9 @@ def intraday_bot_signal(strategy, rows, price, previous_price, spy_rows=None,
         if relative_volume is None or relative_volume < 1.3:
             return None, "งดซื้อ · Relative Volume ต่ำกว่า 1.3x"
         opening_high = max(float(row["h"]) for row in opening)
-        if price > opening_high and price > stock_vwap and spy_vwap is not None and float(spy_session[-1]["c"]) > spy_vwap:
+        # Require a fresh cross above the opening range. If the previous quote
+        # is unavailable, we cannot establish that this is a new breakout.
+        if previous_price is not None and previous_price <= opening_high and price > opening_high and price > stock_vwap and spy_vwap is not None and float(spy_session[-1]["c"]) > spy_vwap:
             return "buy", f"ทะลุ High 15 นาทีแรกเหนือ VWAP · Relative Volume {relative_volume:.2f}x"
         return None, "รอทะลุ Opening Range High พร้อม VWAP/Volume ยืนยัน"
     if strategy == "botEmaMomentum":
@@ -662,7 +762,7 @@ def protective_prices(reference_price, atr, stop_atr=1.5, reward_r=2.0):
 
 
 def risk_sized_quantity(notional_cap, account_equity, risk_pct, entry_price, stop_price):
-    """Whole-share size bounded by both notional and planned stop risk."""
+    """Fractional share size, rounded down to six decimals and risk bounded."""
     values = (notional_cap, account_equity, risk_pct, entry_price, stop_price)
     if any(value is None or not math.isfinite(float(value)) for value in values):
         return 0
@@ -671,4 +771,5 @@ def risk_sized_quantity(notional_cap, account_equity, risk_pct, entry_price, sto
     if notional_cap <= 0 or account_equity <= 0 or risk_pct <= 0 or entry_price <= 0 or stop_price <= 0 or distance <= 0:
         return 0
     risk_budget = account_equity * risk_pct / 100
-    return max(0, min(math.floor(notional_cap / entry_price), math.floor(risk_budget / distance)))
+    shares = min(notional_cap / entry_price, risk_budget / distance)
+    return max(0.0, math.floor(shares * 1_000_000) / 1_000_000)

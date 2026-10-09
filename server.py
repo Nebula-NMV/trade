@@ -21,7 +21,7 @@ import time
 from strategy_engine import (BOT_STRATEGIES as INTRADAY_BOT_STRATEGIES, BOT_STRATEGY_CATALOG,
                              BOT_STRATEGY_BY_ID, NO_TARGET_STRATEGIES, REGIME_STRATEGIES,
                              STRATEGIES as DAILY_STRATEGIES, STRATEGY_CATALOG, STRATEGY_WARMUP,
-                             generate_signals, intraday_atr, intraday_bot_signal,
+                             backtest_intraday_strategy, generate_signals, intraday_atr, intraday_bot_signal,
                              recommend_intraday_bot_strategy,
                              opening_relative_volume as shared_opening_relative_volume, protective_prices,
                              risk_sized_quantity)
@@ -76,6 +76,9 @@ try:
     ACTIVE_TRADING_MODE = configured_trading_mode()
 except RuntimeError:
     ACTIVE_TRADING_MODE = "paper" if os.environ.get("ALPACA_TRADING_MODE", "paper").strip().lower() != "live" else "live-disabled"
+
+BOT_STATE_PATH = ROOT / ".signal-bot-state.json"
+BOT_JOURNAL_PATH = ROOT / ".signal-bot-journal.sqlite3"
 
 if ACTIVE_TRADING_MODE == "live":
     live_data_dir = Path(os.environ.get("ALPACA_LIVE_DATA_DIR", str(ROOT))).expanduser()
@@ -140,15 +143,14 @@ def to_eastern(value):
     return utc_value.astimezone(daylight if start_utc <= utc_value < end_utc else standard)
 
 BOT_LOCK = RLock()
-BOT_STATE_PATH = ROOT / ".signal-bot-state.json"
-BOT_JOURNAL_PATH = ROOT / ".signal-bot-journal.sqlite3"
 BOT = {
     "active": False, "strategy": None, "symbol_strategies": {}, "strategy_reasons": {},
     "symbols": [], "per_trade_usd": 0, "risk_pct": 0.5,
     "max_total_usd": 0, "max_daily_loss_pct": 1.0, "max_daily_trades": 3, "daily_guard": {},
-    "started_at": None, "last_check": None,
+    "started_at": None, "last_check": None, "last_daily_report_date": None,
     "last_message": "บอทยังไม่ทำงาน", "events": [], "owned_positions": {},
     "thread": None, "stop_event": None, "market_stream_status": "stopped", "market_stream_socket": None,
+    "market_session_open": False,
 }
 BOT_MARKET_LOCK = RLock()
 BOT_PERSIST_LOCK = Lock()
@@ -165,6 +167,7 @@ def journal_connect():
 
 
 def initialize_bot_journal():
+    BOT_JOURNAL_PATH.parent.mkdir(parents=True, exist_ok=True)
     with journal_connect() as connection:
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("""CREATE TABLE IF NOT EXISTS bot_events (
@@ -324,11 +327,26 @@ def notification_worker():
 
 def queue_bot_notification(event):
     message = event.get("message", "")
-    if not any(term in message.lower() for term in (
-            "ส่งคำสั่งซื้อ", "ส่งคำสั่งขาย", "ส่ง market paper", "ส่ง bracket paper",
-            "ติด oco ไม่สำเร็จ", "oco ไม่ผ่าน", "ส่งคำสั่งปิด paper",
-            "บอท intraday live หยุดเพราะข้อผิดพลาด",
-            "บอทรายวันหยุดเพราะข้อผิดพลาดภายใน")):
+    lower = message.lower()
+    # Match both "paper" and "live" variants so Live-mode messages are not silently dropped.
+    order_terms = (
+        "ส่งคำสั่งซื้อ", "ส่งคำสั่งขาย",
+        "ส่ง market paper", "ส่ง market live",
+        "ส่ง bracket paper", "ส่ง bracket live",
+        "ส่งคำสั่งปิด paper", "ส่งคำสั่งปิด live",
+        "ติด oco ไม่สำเร็จ", "oco ไม่ผ่าน",
+        "sent live limit", "sent market buy",
+        "จับคู่แล้ว",
+    )
+    system_terms = (
+        "บอท intraday live หยุดเพราะข้อผิดพลาด",
+        "บอทรายวันหยุดเพราะข้อผิดพลาดภายใน", "รายงาน pnl ประจำวัน",
+        "แจ้งเตือน websocket iex", "การเชื่อมต่อ iex กลับมาแล้ว",
+        "แจ้งเตือน heartbeat บอท", "heartbeat บอทกลับมาทำงานแล้ว",
+        "ข้ามซื้อ · cooldown",
+        "หยุดเปิดสถานะใหม่วันนี้",
+    )
+    if not any(term in lower for term in order_terms + system_terms):
         return
     try:
         BOT_NOTIFICATION_QUEUE.put_nowait(event)
@@ -340,10 +358,12 @@ def persist_bot_state():
     global BOT_PERSIST_SIGNATURE
     try:
         with BOT_PERSIST_LOCK:
+            BOT_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
             with BOT_LOCK:
                 saved = copy.deepcopy({key: BOT.get(key) for key in (
                     "strategy", "symbol_strategies", "strategy_reasons", "symbols", "per_trade_usd", "max_total_usd", "risk_pct", "max_daily_loss_pct",
                     "max_daily_trades", "daily_guard", "owned_positions", "processed", "events",
+                    "last_daily_report_date",
                 )})
             signature = json.dumps(saved, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
             if signature == BOT_PERSIST_SIGNATURE:
@@ -367,7 +387,8 @@ def restore_bot_state():
     events = recent_journal_events() or (saved_events if isinstance(saved_events, list) else [])
     with BOT_LOCK:
         for key in ("strategy", "symbol_strategies", "strategy_reasons", "symbols", "per_trade_usd", "max_total_usd", "risk_pct", "max_daily_loss_pct",
-                    "max_daily_trades", "daily_guard", "owned_positions", "processed"):
+                    "max_daily_trades", "daily_guard", "owned_positions", "processed",
+                    "last_daily_report_date"):
             if key in saved:
                 BOT[key] = saved[key]
         if BOT.get("strategy") not in BOT_STRATEGIES:
@@ -450,10 +471,13 @@ def bot_snapshot():
             "active", "strategy", "symbol_strategies", "strategy_reasons", "symbols", "per_trade_usd", "max_total_usd", "risk_pct",
             "max_daily_loss_pct", "max_daily_trades", "daily_guard",
             "started_at", "last_check", "last_message", "events", "owned_positions", "market_stream_status",
+            "market_session_open",
         )})
         thread = BOT.get("thread")
         snapshot["thread_alive"] = bool(thread and thread.is_alive())
         snapshot["trading_mode"] = ACTIVE_TRADING_MODE
+        monitored_strategies = list((snapshot.get("symbol_strategies") or {}).values()) or [snapshot.get("strategy")]
+        snapshot["heartbeat_threshold_seconds"] = 150 if any(value in LIVE_INTRADAY_STRATEGIES for value in monitored_strategies) else 600
     try:
         last_check = datetime.fromisoformat(snapshot["last_check"]) if snapshot.get("last_check") else None
         snapshot["heartbeat_age_seconds"] = max(0, int((datetime.now(timezone.utc) - last_check).total_seconds())) if last_check else None
@@ -539,6 +563,168 @@ def bot_log(message):
     journal_event(event)
     queue_bot_notification(event)
     persist_bot_state()
+
+
+def _journal_fills_for_daily_report(today):
+    """Return today's completed bot entries and realized P/L matched FIFO from journal fills."""
+    try:
+        with journal_connect() as connection:
+            rows = connection.execute("""SELECT submitted_at,symbol,side,status,filled_qty,fill_price,order_json
+                FROM bot_orders WHERE side IN ('buy','sell') ORDER BY submitted_at,order_id""").fetchall()
+    except sqlite3.Error:
+        return 0, 0.0
+    fills, entries = [], 0
+    for row in rows:
+        try:
+            details = json.loads(row["order_json"] or "{}")
+            qty = float(row["filled_qty"] or details.get("filled_qty") or 0)
+            price = float(row["fill_price"] or details.get("filled_avg_price") or 0)
+            if qty <= 0 or price <= 0:
+                continue
+            filled_at = details.get("filled_at") or row["submitted_at"]
+            timestamp = datetime.fromisoformat(str(filled_at).replace("Z", "+00:00"))
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            fill_day = to_eastern(timestamp).date().isoformat()
+            if row["side"] == "buy" and fill_day == today:
+                entries += 1
+            fills.append((timestamp.timestamp(), fill_day, row["symbol"], row["side"], qty, price))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+    lots, realized = {}, 0.0
+    for _, fill_day, symbol, side, qty, price in sorted(fills):
+        symbol_lots = lots.setdefault(symbol, [])
+        if side == "buy":
+            symbol_lots.append([qty, price])
+            continue
+        remaining = qty
+        while remaining > 1e-9 and symbol_lots:
+            lot_qty, lot_price = symbol_lots[0]
+            matched = min(remaining, lot_qty)
+            if fill_day == today:
+                realized += (price - lot_price) * matched
+            remaining -= matched
+            symbol_lots[0][0] -= matched
+            if symbol_lots[0][0] <= 1e-9:
+                symbol_lots.pop(0)
+    return entries, realized
+
+
+def send_daily_pnl_report(session_date):
+    account = alpaca_request("/account")
+    positions = alpaca_request("/positions")
+    entries, realized = _journal_fills_for_daily_report(session_date)
+    equity = float(account.get("equity", 0) or 0)
+    previous_equity = float(account.get("last_equity", 0) or 0)
+    equity_delta = equity - previous_equity if previous_equity > 0 else None
+    market_value = sum(abs(float(item.get("market_value", 0) or 0)) for item in positions)
+    holdings = ", ".join(
+        f"{item.get('symbol')} {float(item.get('qty', 0) or 0):g} sh"
+        for item in positions[:8]) or "ไม่มีสถานะคงเหลือ"
+    delta_text = f"{equity_delta:+,.2f}" if equity_delta is not None else "ไม่มีค่า last_equity"
+    bot_log(f"รายงาน PnL ประจำวัน · {session_date} ET · ไม้ซื้อที่จับคู่แล้ว {entries} · Realized P/L จากราคา Fill ก่อนค่าธรรมเนียม {realized:+,.2f} USD · Equity Δ เทียบวันก่อน {delta_text} USD · พอร์ตคงเหลือ {len(positions)} สถานะ / มูลค่า ${market_value:,.2f} · Equity ${equity:,.2f} · {holdings}")
+
+
+def bot_notification_monitor(stop_event):
+    """Watch IEX connectivity and loop heartbeat; report once per outage."""
+    stream_down_since = None
+    stream_alerted = False
+    heartbeat_alerted = False
+    market_open = False
+    next_clock_check = 0.0
+    while not stop_event.wait(15):
+        snapshot = bot_snapshot()
+        if not snapshot.get("active"):
+            stream_down_since = None
+            stream_alerted = heartbeat_alerted = False
+            continue
+        now_mono = time.monotonic()
+        if now_mono >= next_clock_check:
+            next_clock_check = now_mono + 30
+            try:
+                market_open = bool(alpaca_request("/clock").get("is_open"))
+                with BOT_LOCK:
+                    BOT["market_session_open"] = market_open
+            except (RuntimeError, ValueError, KeyError, TypeError):
+                pass
+        if not market_open:
+            stream_down_since = None
+            stream_alerted = heartbeat_alerted = False
+            continue
+        intraday = any(BOT_STRATEGY_BY_ID.get(value, {}).get("mode") == "intraday"
+                       for value in snapshot.get("symbol_strategies", {}).values())
+        if not snapshot.get("symbol_strategies"):
+            intraday = snapshot.get("strategy") in LIVE_INTRADAY_STRATEGIES
+        threshold = 150 if intraday else 600
+        status = snapshot.get("market_stream_status")
+        if intraday and status != "connected":
+            stream_down_since = stream_down_since or now_mono
+            if not stream_alerted and now_mono - stream_down_since >= 150:
+                bot_log(f"แจ้งเตือน WebSocket IEX · ขาดการเชื่อมต่อเกิน 150 วินาทีระหว่างตลาดเปิด · สถานะ {status or 'unknown'} · บอทยังทำงานแต่ไม่ส่งคำสั่งใหม่")
+                stream_alerted = True
+        elif status == "connected":
+            if stream_alerted:
+                bot_log("การเชื่อมต่อ IEX กลับมาแล้ว · WebSocket connected · Intraday Bot กลับมาตรวจราคา")
+            stream_down_since = None
+            stream_alerted = False
+        try:
+            last_check = datetime.fromisoformat(snapshot["last_check"].replace("Z", "+00:00")) if snapshot.get("last_check") else None
+            age = (datetime.now(timezone.utc) - last_check.astimezone(timezone.utc)).total_seconds() if last_check else None
+        except (TypeError, ValueError):
+            age = None
+        if (age is None or age > threshold) and not heartbeat_alerted:
+            age_text = f"เกิน {int(age)} วินาที" if age is not None else "ยังไม่มีรอบตรวจแรก"
+            bot_log(f"แจ้งเตือน Heartbeat บอท · {age_text} ระหว่างตลาดเปิด · ตรวจสอบสถานะบอทในหน้า Trading")
+            heartbeat_alerted = True
+        elif age is not None and age <= 60 and heartbeat_alerted:
+            bot_log("Heartbeat บอทกลับมาทำงานแล้ว · รอบตรวจล่าสุดปกติ")
+            heartbeat_alerted = False
+
+
+def daily_pnl_report_worker(stop_event):
+    """Send one daily account and bot-fill summary after each US session close."""
+    checked_date = None
+    next_calendar_check = 0.0
+    next_report_attempt = 0.0
+    calendar = {}
+    while not stop_event.wait(30):
+        if not (os.environ.get("TELEGRAM_BOT_TOKEN", "").strip() and os.environ.get("TELEGRAM_CHAT_ID", "").strip()) and not os.environ.get("DISCORD_WEBHOOK_URL", "").strip():
+            continue
+        now_et = to_eastern(datetime.now(timezone.utc))
+        day = now_et.date().isoformat()
+        if checked_date != day or time.monotonic() >= next_calendar_check:
+            checked_date = day
+            next_calendar_check = time.monotonic() + 300
+            next_report_attempt = 0.0
+            try:
+                sessions = alpaca_request(f"/calendar?start={day}&end={day}")
+                calendar = {str(item.get("date")): item for item in sessions if isinstance(item, dict)}
+            except (RuntimeError, ValueError, TypeError):
+                calendar = {}
+                next_calendar_check = time.monotonic() + 30
+        session = calendar.get(day)
+        if not session:
+            continue
+        try:
+            close = datetime.strptime(session["close"], "%H:%M").time()
+        except (KeyError, TypeError, ValueError):
+            continue
+        if now_et.time() < close:
+            continue
+        with BOT_LOCK:
+            already_sent = BOT.get("last_daily_report_date") == day
+        if already_sent:
+            continue
+        if time.monotonic() < next_report_attempt:
+            continue
+        try:
+            send_daily_pnl_report(day)
+            with BOT_LOCK:
+                BOT["last_daily_report_date"] = day
+            persist_bot_state()
+        except (RuntimeError, ValueError, KeyError, TypeError) as exc:
+            next_report_attempt = time.monotonic() + 300
+            bot_log(f"สร้างสรุปประจำวันไม่สำเร็จ · จะลองใหม่ · {exc}")
 
 
 initialize_bot_journal()
@@ -741,18 +927,49 @@ def place_oco_protection(symbol, position, owned):
     target = float(owned.get("target", 0))
     if qty <= 0 or stop <= 0 or target <= stop:
         raise ValueError("ปริมาณหรือระดับ OCO ไม่ถูกต้อง")
+    fractional = abs(qty - round(qty)) > 1e-8
     entry_id = re.sub(r"[^0-9A-Za-z]", "", str(owned.get("order_id", "")))[-10:]
-    client_suffix = entry_id or re.sub(r"[^0-9A-Za-z]", "", str(owned.get("entry_date", "")))[-10:]
+    client_suffix = (entry_id or re.sub(r"[^0-9A-Za-z]", "", str(owned.get("entry_date", "")))[-10:])
+    revision = int(owned.get("protection_revision", 0))
     payload = {
         "symbol": symbol, "qty": f"{qty:.6f}".rstrip("0").rstrip("."), "side": "sell",
-        "type": "limit", "time_in_force": "gtc", "order_class": "oco",
+        "type": "limit", "time_in_force": "day" if fractional else "gtc", "order_class": "oco",
         "take_profit": {"limit_price": order_price(target)},
         "stop_loss": {"stop_price": order_price(stop)},
-        "client_order_id": f"sg-{symbol.lower()}-{client_suffix}-oco",
+        "client_order_id": f"sg-{symbol.lower()}-{client_suffix}-r{revision}-oco",
     }
     result = bot_order_request(payload, "ติดตั้ง OCO Stop/Take Profit", owned.get("strategy"), stop)
     owned["protection_order_id"] = result.get("id")
     return result
+
+
+def ratchet_intraday_stop(symbol, position, owned, price, atr):
+    """Move an intraday OCO stop to breakeven at 1R, then trail by 1 ATR."""
+    entry = float(owned.get("entry_price", 0))
+    risk = float(owned.get("risk_distance", 0))
+    current_stop = float(owned.get("stop", 0))
+    if entry <= 0 or risk <= 0 or atr <= 0 or price < entry + risk:
+        return False
+    next_stop = max(entry, price - atr)
+    if next_stop <= current_stop + max(.01, entry * .0001):
+        return False
+    protection_id = owned.get("protection_order_id")
+    if protection_id and time.time() - float(owned.get("last_trail_update_at", 0)) < 60:
+        return False
+    try:
+        if protection_id:
+            result = alpaca_request(f"/orders/{quote(str(protection_id), safe='')}", method="PATCH",
+                                    payload={"stop_price": order_price(next_stop)})
+            owned["protection_order_id"] = result.get("id", protection_id)
+        else:
+            place_oco_protection(symbol, position, owned)
+        owned["stop"] = next_stop
+        owned["last_trail_update_at"] = time.time()
+    except (RuntimeError, ValueError) as exc:
+        bot_log(f"{symbol}: เลื่อน Trailing Stop ไม่สำเร็จ · OCO เดิมยังคงป้องกัน · {exc}")
+        return False
+    bot_log(f"{symbol}: เลื่อน Stop เป็น ${next_stop:.2f} · Breakeven/Trailing 1 ATR")
+    return True
 
 
 def close_intraday_unprotected(symbol, position, owned):
@@ -806,6 +1023,8 @@ def auto_bot_realtime_loop(stop_event):
     bars_cache, spy_bars_cache, prior_prices, prior_price_sessions, seen_ticks = {}, {}, {}, {}, {}
     account, positions, order_history, open_orders = {}, {}, [], []
     orders_by_id, pending = {}, set()
+    last_exit_time: dict = {}  # symbol -> monotonic time of last stop/take-profit fill
+    REENTRY_COOLDOWN_SECONDS = 120  # ห้าม re-enter หลัง Stop/Take Profit ออกภายใน 2 นาที
     next_sync = 0.0
     market_clock, next_clock_sync = None, 0.0
     while not stop_event.is_set():
@@ -849,6 +1068,10 @@ def auto_bot_realtime_loop(stop_event):
                     entry_id = owned_data.get("order_id")
                     entry_order = orders_by_id.get(entry_id, {}) if entry_id else {}
                     protection_id = owned_data.get("protection_order_id")
+                    protection_order = orders_by_id.get(protection_id, {}) if protection_id else {}
+                    if protection_id and protection_order.get("status") in {"canceled", "rejected", "expired", "done_for_day"}:
+                        owned_data.pop("protection_order_id", None)
+                        protection_id = None
                     linked_exit_filled = any(
                         item.get("symbol") == owned_symbol and item.get("side") == "sell" and item.get("status") == "filled"
                         and (item.get("parent_order_id") in {entry_id, protection_id} or item.get("id") == protection_id)
@@ -856,6 +1079,7 @@ def auto_bot_realtime_loop(stop_event):
                     )
                     if not position and linked_exit_filled:
                         owned_positions.pop(owned_symbol, None)
+                        last_exit_time[owned_symbol] = time.monotonic()
                         bot_log(f"{owned_symbol}: ล้างสถานะหลัง Stop/Take Profit ปิดแล้ว")
                         continue
                     if entry_order.get("status") in {"rejected", "canceled", "expired", "done_for_day"} and not position:
@@ -945,9 +1169,20 @@ def auto_bot_realtime_loop(stop_event):
                             rel_volume = opening_relative_volume(bars, local_now.date())
                             relative_volume = rel_volume
                         elapsed = local_now.hour * 60 + local_now.minute - (9 * 60 + 30)
-                        signal, reason = intraday_bot_signal(
-                            strategy, bars, price, previous_price, spy_rows=spy_rows,
-                            relative_volume=relative_volume, elapsed_minutes=elapsed, owned=owned)
+                        if owned and position:
+                            session_start = local_now.replace(hour=9, minute=30, second=0, microsecond=0).timestamp()
+                            session_bars = [bar for bar in bars if datetime.fromisoformat(bar["t"].replace("Z", "+00:00")).timestamp() >= session_start]
+                            current_atr = intraday_atr(session_bars)
+                            if current_atr and current_atr > 0 and ratchet_intraday_stop(symbol, position, owned, price, current_atr):
+                                signal, reason = None, "เลื่อน Breakeven/Trailing Stop แล้ว"
+                            else:
+                                signal, reason = intraday_bot_signal(
+                                    strategy, bars, price, previous_price, spy_rows=spy_rows,
+                                    relative_volume=relative_volume, elapsed_minutes=elapsed, owned=owned)
+                        else:
+                            signal, reason = intraday_bot_signal(
+                                strategy, bars, price, previous_price, spy_rows=spy_rows,
+                                relative_volume=relative_volume, elapsed_minutes=elapsed, owned=owned)
                         prior_prices[symbol] = price
                         prior_price_sessions[symbol] = session_key
                         seen_ticks[symbol] = tick_timestamp
@@ -959,6 +1194,10 @@ def auto_bot_realtime_loop(stop_event):
                     if signal == "buy" and daily_halted:
                         continue
                     if signal == "buy" and minutes_to_close <= 15:
+                        continue
+                    if signal == "buy" and time.monotonic() - last_exit_time.get(symbol, 0) < REENTRY_COOLDOWN_SECONDS:
+                        remaining_cd = int(REENTRY_COOLDOWN_SECONDS - (time.monotonic() - last_exit_time[symbol]))
+                        bot_log(f"{symbol}: ข้ามซื้อ · Cooldown หลัง Stop/Take Profit ยังเหลือ {remaining_cd} วินาที")
                         continue
                     if symbol in pending and not (signal == "sell" and position and owned):
                         continue
@@ -984,10 +1223,11 @@ def auto_bot_realtime_loop(stop_event):
                         sizing_price = float(live_entry_limit) if live_entry_limit else price
                         qty = risk_sized_quantity(room * (.99 if live_entry_limit else 1), float(account.get("equity", 0)),
                                                   config.get("risk_pct", .5), sizing_price, stop)
-                        if qty < 1:
-                            bot_log(f"{symbol}: ข้ามซื้อ · วงเงินความเสี่ยง {config.get('risk_pct', .5):g}% หรือวงเงินต่อหุ้นไม่พอสำหรับ 1 หุ้น")
+                        if qty <= 0 or qty * sizing_price < 1:
+                            bot_log(f"{symbol}: ข้ามซื้อ · วงเงินความเสี่ยง {config.get('risk_pct', .5):g}% หรือวงเงินต่อหุ้นไม่พอ")
                             continue
-                        order = {"symbol": symbol, "qty": str(qty), "side": "buy", "type": "market",
+                        qty_text = f"{qty:.6f}".rstrip("0").rstrip(".")
+                        order = {"symbol": symbol, "qty": qty_text, "side": "buy", "type": "market",
                                  "time_in_force": "day", "client_order_id": client_id}
                         if live_entry_limit:
                             order["type"] = "limit"
@@ -1002,7 +1242,7 @@ def auto_bot_realtime_loop(stop_event):
                             "risk_distance": risk_distance, "reward_r": reward_r, "order_id": result.get("id"), "strategy": strategy,
                             "awaiting_fill": True}
                         pending.add(symbol)
-                        bot_log(f"{symbol}: sent {'Live Limit' if live_entry_limit else 'Market'} buy {qty} shares | limit {live_entry_limit or 'market'} | stop ${stop:.2f} / target ${target:.2f} | {reason}")
+                        bot_log(f"{symbol}: sent {'Live Limit' if live_entry_limit else 'Market'} buy {qty:g} shares | limit {live_entry_limit or 'market'} | stop ${stop:.2f} / target ${target:.2f} | {reason}")
                         for _ in range(5):
                             time.sleep(.2)
                             entry = alpaca_request(f"/orders/{quote(str(result.get('id')), safe='')}")
@@ -1299,16 +1539,18 @@ def auto_bot_loop(stop_event):
                     entry_limit = max(reference * (1 + signal_data["entryBufferPct"]), reference + signal_data["entryBufferAbsolute"])
                     stop = min(stop, entry_limit - signal_data["entryBufferAbsolute"])
                     qty = risk_sized_quantity(room, float(account.get("equity", 0)), config.get("risk_pct", .5), entry_limit, stop)
-                    if qty < 1:
-                        bot_log(f"{symbol}: ข้ามซื้อ · วงเงินความเสี่ยง {config.get('risk_pct', .5):g}% หรือวงเงินต่อหุ้นไม่พอสำหรับ 1 หุ้น")
+                    if qty <= 0 or qty * entry_limit < 1:
+                        bot_log(f"{symbol}: ข้ามซื้อ · วงเงินความเสี่ยง {config.get('risk_pct', .5):g}% หรือวงเงินต่อหุ้นไม่พอ")
                         processed[symbol] = processed_key
                         continue
+                    qty_text = f"{qty:.6f}".rstrip("0").rstrip(".")
+                    entry_tif = "day" if abs(qty - round(qty)) > 1e-8 else "gtc"
                     trend_exit = strategy in NO_TARGET_STRATEGIES
                     if intraday:
                         live_entry_limit = order_price(entry_limit) if ACTIVE_TRADING_MODE == "live" else None
                         # Market entry follows the closed-bar signal immediately;
                         # a separate GTC OCO is attached as soon as the fill is visible.
-                        order = {"symbol": symbol, "qty": str(qty), "side": "buy",
+                        order = {"symbol": symbol, "qty": qty_text, "side": "buy",
                                  "type": "limit" if live_entry_limit else "market",
                                  "time_in_force": "day", "client_order_id": client_id}
                         if live_entry_limit:
@@ -1316,16 +1558,16 @@ def auto_bot_loop(stop_event):
                     elif trend_exit:
                         # Long-term positions use a protective ATR stop and exit
                         # on the shared trend-reversal signal, without a fixed target.
-                        order = {"symbol": symbol, "qty": str(qty), "side": "buy", "type": "limit",
-                                 "limit_price": order_price(entry_limit), "time_in_force": "gtc",
+                        order = {"symbol": symbol, "qty": qty_text, "side": "buy", "type": "limit",
+                                 "limit_price": order_price(entry_limit), "time_in_force": entry_tif,
                                  "order_class": "oto", "stop_loss": {"stop_price": order_price(stop)},
                                  "client_order_id": client_id}
                     else:
                         # Anchor the fixed target to the planned limit entry;
                         # using the signal close understated the requested R:R.
                         target = entry_limit + (entry_limit - stop) * signal_data["rewardRisk"]
-                        order = {"symbol": symbol, "qty": str(qty), "side": "buy", "type": "limit", "limit_price": order_price(entry_limit),
-                                 "time_in_force": "gtc", "order_class": "bracket",
+                        order = {"symbol": symbol, "qty": qty_text, "side": "buy", "type": "limit", "limit_price": order_price(entry_limit),
+                                 "time_in_force": entry_tif, "order_class": "bracket",
                                  "take_profit": {"limit_price": order_price(target)},
                                  "stop_loss": {"stop_price": order_price(stop)}, "client_order_id": client_id}
                     result = bot_order_request(order, reason, strategy, entry_limit if not intraday else reference)
@@ -1660,6 +1902,8 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_json(403, {"error": "ปฏิเสธคำขอจากแหล่งที่มาอื่น"})
         if parsed.path == "/api/strategy/signals":
             return self.handle_strategy_signals()
+        if parsed.path == "/api/strategy/intraday-backtest":
+            return self.handle_intraday_backtest()
         if parsed.path == "/api/alpaca/orders":
             return self.handle_alpaca_order()
         if parsed.path == "/api/alpaca/bot/start":
@@ -2003,6 +2247,30 @@ class Handler(SimpleHTTPRequestHandler):
         except (ValueError, TypeError, KeyError, json.JSONDecodeError, RuntimeError) as exc:
             self.send_json(400, {"error": str(exc) or "เริ่มบอทไม่ได้"})
 
+    def handle_intraday_backtest(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 4_000_000:
+                return self.send_json(400, {"error": "ข้อมูล Replay ไม่ถูกต้อง"})
+            payload = json.loads(self.rfile.read(length))
+            strategy, rows = payload.get("strategy"), payload.get("rows")
+            spy_rows = payload.get("spy_rows") or []
+            if strategy not in INTRADAY_BOT_STRATEGIES or not isinstance(rows, list) or not 1 <= len(rows) <= 10000:
+                return self.send_json(400, {"error": "เลือกกลยุทธ์ Intraday และข้อมูลแท่ง 1 นาทีไม่เกิน 10,000 แท่ง"})
+            capital = float(payload.get("capital", 10000))
+            fee = float(payload.get("fee_pct", .1))
+            slippage = float(payload.get("slippage_pct", .05))
+            risk_pct = float(payload.get("risk_pct", .5))
+            max_position_pct = float(payload.get("max_position_pct", 20))
+            if (not math.isfinite(capital) or not 1 <= capital <= 1_000_000_000
+                    or not 0 <= fee <= 5 or not 0 <= slippage <= 5
+                    or not .1 <= risk_pct <= 5 or not 1 <= max_position_pct <= 100):
+                return self.send_json(400, {"error": "เงินทุน/ความเสี่ยง/วงเงินต่อไม้/ค่าธรรมเนียมอยู่นอกช่วงที่รองรับ"})
+            return self.send_json(200, backtest_intraday_strategy(
+                strategy, rows, spy_rows, capital, fee, slippage, risk_pct, max_position_pct))
+        except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            return self.send_json(400, {"error": str(exc) or "Replay กลยุทธ์ Intraday ไม่สำเร็จ"})
+
     def handle_alpaca_order(self):
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -2108,4 +2376,9 @@ if __name__ == "__main__":
 
     print(f"Signal is ready on port {server.server_port}")
     Thread(target=notification_worker, daemon=True, name="bot-notification-worker").start()
+    monitor_stop = Event()
+    Thread(target=bot_notification_monitor, args=(monitor_stop,), daemon=True,
+           name="bot-notification-monitor").start()
+    Thread(target=daily_pnl_report_worker, args=(monitor_stop,), daemon=True,
+           name="daily-pnl-report-worker").start()
     server.serve_forever()

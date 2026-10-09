@@ -61,24 +61,51 @@ class GenerateSignalsTests(unittest.TestCase):
     def test_bot_opening_range_strategy_requires_volume_and_confirmed_breakout(self):
         start = datetime(2025, 1, 6, 14, 30, tzinfo=timezone.utc)
 
-        def session(base):
+        def flat_session(base):
+            """All bars at 'base'. opening_high = base + 0.02."""
             rows = []
             for i in range(60):
-                close = base if i < 15 else base + (i - 14) * .05
+                stamp = start + timedelta(minutes=i)
+                rows.append({"t": int(stamp.timestamp()), "o": base, "h": base + .02,
+                             "l": base - .02, "c": base, "v": 1000})
+            return rows
+
+        def rising_session(base):
+            """Slight uptrend so last close > VWAP (required by ORB15 SPY filter)."""
+            rows = []
+            for i in range(60):
+                close = base + i * 0.01
                 stamp = start + timedelta(minutes=i)
                 rows.append({"t": int(stamp.timestamp()), "o": close, "h": close + .02,
                              "l": close - .02, "c": close, "v": 1000})
             return rows
 
-        stock, spy = session(100), session(200)
-        price = stock[-1]["c"] + .05
-        signal, _ = intraday_bot_signal("botOrb15", stock, price, stock[-1]["c"], spy,
-                                        relative_volume=1.5, elapsed_minutes=60)
+        stock = flat_session(100)
+        spy   = rising_session(200)     # last close > VWAP → ORB15 SPY condition passes
+        opening_high = 100 + 0.02      # max(h) of first 15 flat bars
+
+        # previous_price just below opening_high → fresh breakout tick → buy expected.
+        prev_price     = opening_high - 0.001
+        breakout_price = opening_high + 0.05
+
+        signal, _ = intraday_bot_signal(
+            "botOrb15", stock, breakout_price, prev_price, spy,
+            relative_volume=1.5, elapsed_minutes=60)
         self.assertEqual(signal, "buy")
-        blocked, reason = intraday_bot_signal("botOrb15", stock, price, stock[-1]["c"], spy,
-                                              relative_volume=1.0, elapsed_minutes=60)
+
+        # Low relative volume → blocked regardless of fresh cross.
+        blocked, reason = intraday_bot_signal(
+            "botOrb15", stock, breakout_price, prev_price, spy,
+            relative_volume=1.0, elapsed_minutes=60)
         self.assertIsNone(blocked)
         self.assertIn("Relative Volume", reason)
+
+        # previous_price already above opening_high → stale, not a fresh breakout.
+        stale_prev = opening_high + 0.10
+        stale_signal, _ = intraday_bot_signal(
+            "botOrb15", stock, breakout_price, stale_prev, spy,
+            relative_volume=1.5, elapsed_minutes=60)
+        self.assertIsNone(stale_signal, "ไม่ควรซื้อซ้ำเมื่อราคา previous_price เหนือ ORB High แล้ว")
 
     def test_all_registered_strategies_return_valid_event_series(self):
         closes = [100 + i * 0.04 + 2 * math.sin(i / 7) for i in range(320)]
@@ -174,5 +201,16 @@ class IndicatorParityTests(unittest.TestCase):
             assert_series(actual["macd"][name], expected["macd"][name])
 
 
+class ServerConfigTests(unittest.TestCase):
+    def test_server_live_mode_paths_use_live_data_dir(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("server_module", ROOT / "server.py")
+        server_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(server_mod)
+        self.assertEqual(server_mod.BOT_STATE_PATH.name, ".signal-bot-state.json")
+        self.assertEqual(server_mod.BOT_JOURNAL_PATH.name, ".signal-bot-journal.sqlite3")
+
+
 if __name__ == "__main__":
     unittest.main()
+
